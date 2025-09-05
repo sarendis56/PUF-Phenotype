@@ -426,28 +426,17 @@ def train_gpu_classifiers(X_train: np.ndarray, X_test: np.ndarray,
         print("Scaling features for SVM...")
         from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
-        # Remove extreme outliers more aggressively (95th percentile)
-        clip_max = np.percentile(X_train, 95)
-        clip_min = np.percentile(X_train, 5)
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
-        print(f"  Clipping outliers: [{clip_min:.3f}, {clip_max:.3f}]")
-        X_train_clipped = np.clip(X_train, clip_min, clip_max)
-        X_test_clipped = np.clip(X_test, clip_min, clip_max)
-
-        # Use MinMaxScaler for more controlled range
-        scaler = MinMaxScaler(feature_range=(-1, 1))
-        X_train_scaled = scaler.fit_transform(X_train_clipped)
-        X_test_scaled = scaler.transform(X_test_clipped)
-
-        print(f"Original feature range: [{X_train.min():.3f}, {X_train.max():.3f}]")
-        print(f"Clipped feature range: [{X_train_clipped.min():.3f}, {X_train_clipped.max():.3f}]")
-        print(f"Scaled feature range: [{X_train_scaled.min():.3f}, {X_train_scaled.max():.3f}]")
-        print(f"Scaled feature mean: {X_train_scaled.mean():.3f}, std: {X_train_scaled.std():.3f}")
+        print(f"Original feature stats: mean={X_train.mean():.3f}, std={X_train.std():.3f}")
+        print(f"Scaled feature stats: mean={X_train_scaled.mean():.3f}, std={X_train_scaled.std():.3f}")
 
         gpu_classifiers = {
             'SVM': {
-                'classifier': cuSVC(C=10.0, gamma=0.1, kernel='rbf', probability=True),  # Better for high-dim data
-                'use_scaled': False
+                'classifier': cuSVC(C=10.0, gamma='scale', kernel='linear', probability=True),  # Better for high-dim data
+                'use_scaled': True
             },
             'Logistic Regression': {
                 'classifier': cuLogisticRegression(C=1, max_iter=500),
