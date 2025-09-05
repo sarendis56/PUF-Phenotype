@@ -64,22 +64,6 @@ python3 -m uv run main.py \
 - `--save_path`: Directory to save results (default: results)
 - `--no_plots`: Skip generating plots
 
-## Expected Results
-
-Based on the paper, the expected performance for the lightweight VGG16 approach:
-
-### 3 Devices
-- Logistic Regression: ~98.3% accuracy
-- XGBoost: ~99.1% accuracy
-
-### 4 Devices
-- Logistic Regression: ~98.1% accuracy
-- Random Forest: ~98.1% accuracy
-
-### 5 Devices
-- SVM: ~97.9% accuracy
-- Random Forest: ~98.4% accuracy
-
 ## Output Files
 
 The script generates several output files in the results directory:
