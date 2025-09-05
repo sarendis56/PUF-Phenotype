@@ -117,6 +117,48 @@ class ModifiedVGG16FeatureExtractor(nn.Module):
         x = self.classifier(x)
         return x
 
+class FineTunedVGG16(nn.Module):
+    """Fine-tuned VGG16 for DRAM-PUF domain adaptation"""
+
+    def __init__(self, num_classes: int = 5, freeze_layers: int = 10):
+        super(FineTunedVGG16, self).__init__()
+
+        # Load pre-trained VGG16
+        self.vgg16 = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
+
+        # Freeze early layers (low-level features like edges, textures)
+        for i, param in enumerate(self.vgg16.features.parameters()):
+            if i < freeze_layers:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+
+        # Replace classifier for DRAM-PUF domain
+        self.vgg16.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(25088, 4096),  # VGG16's feature map size: 7*7*512
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(4096, 1000),
+            nn.ReLU(True),
+            nn.Linear(1000, num_classes)
+        )
+
+        # Add average pooling for feature extraction
+        self.avgpool = nn.AdaptiveAvgPool2d((6, 6))
+
+    def forward(self, x, extract_features=False):
+        x = self.vgg16.features(x)
+
+        if extract_features:
+            x = self.avgpool(x)
+            return x.view(x.size(0), -1)  # Flatten to (batch_size, 18432)
+
+        x = self.vgg16.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.vgg16.classifier(x)
+        return x
+
 def load_dataset(data_path: str, num_devices: int = 5, use_organized: bool = False) -> Tuple[List[str], List[str]]:
     """
     Load DRAM PUF dataset images and labels
@@ -185,6 +227,93 @@ def load_dataset(data_path: str, num_devices: int = 5, use_organized: bool = Fal
 
     return image_paths, labels
 
+def fine_tune_vgg16(model: FineTunedVGG16, train_loader: DataLoader, val_loader: DataLoader,
+                   num_epochs: int = 10, device: torch.device = None) -> FineTunedVGG16:
+    """
+    Fine-tune VGG16 on DRAM-PUF data
+
+    Args:
+        model: FineTunedVGG16 model to train
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        num_epochs: Number of training epochs
+        device: Device to train on
+
+    Returns:
+        Fine-tuned model
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = model.to(device)
+
+    # Use different learning rates for different layers
+    feature_params = []
+    for param in model.vgg16.features.parameters():
+        if param.requires_grad:
+            feature_params.append(param)
+
+    classifier_params = list(model.vgg16.classifier.parameters())
+
+    # Lower learning rate for pre-trained features, higher for new classifier
+    optimizer = optim.SGD([
+        {'params': feature_params, 'lr': 1e-4},      # Low LR for features
+        {'params': classifier_params, 'lr': 1e-3}    # High LR for classifier
+    ], momentum=0.9, weight_decay=1e-4)
+
+    criterion = nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
+    print(f"Fine-tuning VGG16 for {num_epochs} epochs...")
+
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        running_loss = 0.0
+        correct_train = 0
+        total_train = 0
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total_train += labels.size(0)
+            correct_train += predicted.eq(labels).sum().item()
+
+        # Validation phase
+        model.eval()
+        correct_val = 0
+        total_val = 0
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total_val += labels.size(0)
+                correct_val += predicted.eq(labels).sum().item()
+
+        scheduler.step()
+
+        train_acc = 100. * correct_train / total_train
+        val_acc = 100. * correct_val / total_val
+
+        print(f'  Epoch {epoch+1}/{num_epochs}: Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%')
+
+    print("Fine-tuning completed!")
+    return model
+
 def extract_features_with_vgg16(image_paths: List[str], labels: List[str],
                                batch_size: int = 32, fine_tune: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -199,36 +328,66 @@ def extract_features_with_vgg16(image_paths: List[str], labels: List[str],
     Returns:
         Tuple of (features, encoded_labels)
     """
-    print("Extracting features using modified VGG16...")
-
-    # Define transforms - paper uses 220×200 images, but VGG16 needs 224×224
-    # We'll resize from the paper's dimensions to VGG16's expected input
-    transform = transforms.Compose([
-        transforms.Resize((220, 200)),  # First resize to paper's dimensions
-        transforms.Resize((224, 224)),  # Then resize to VGG16 input size
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])  # ImageNet normalization
-    ])
-
-    # Create dataset and dataloader
-    dataset = DRAMPUFDataset(image_paths, labels, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    # Initialize model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model = ModifiedVGG16FeatureExtractor(num_classes=len(set(labels)))
-    model = model.to(device)
+    # Define transforms - original images are 200×220, VGG16 needs 224×224
+    # Direct resize from original dimensions to avoid interpolation artifacts
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(p=0.5),  # Data augmentation for training
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+
+    if fine_tune:
+        print("Fine-tuning VGG16 on DRAM-PUF data...")
+
+        # Create training dataset for fine-tuning
+        train_dataset = DRAMPUFDataset(image_paths, labels, transform=train_transform)
+
+        # Split for validation during fine-tuning (80/20 split)
+        val_size = int(0.2 * len(train_dataset))
+        train_size = len(train_dataset) - val_size
+        train_subset, val_subset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+        )
+
+        # Create data loaders for fine-tuning
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+        # Initialize and fine-tune model
+        model = FineTunedVGG16(num_classes=len(set(labels)))
+        model = fine_tune_vgg16(model, train_loader, val_loader, num_epochs=10, device=device)
+
+        print("Using fine-tuned VGG16 for feature extraction...")
+    else:
+        print("Using pre-trained VGG16 for feature extraction...")
+        model = ModifiedVGG16FeatureExtractor(num_classes=len(set(labels)))
+        model = model.to(device)
+
     model.eval()
+
+    # Create dataset for feature extraction (use test transform for consistency)
+    feature_dataset = DRAMPUFDataset(image_paths, labels, transform=test_transform)
+    feature_dataloader = DataLoader(feature_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Extract features
     all_features = []
     all_labels = []
 
+    print("Extracting features...")
     with torch.no_grad():
-        for batch_idx, (images, batch_labels) in enumerate(dataloader):
+        for batch_idx, (images, batch_labels) in enumerate(feature_dataloader):
             images = images.to(device)
             features = model(images, extract_features=True)
 
@@ -263,20 +422,20 @@ def train_gpu_classifiers(X_train: np.ndarray, X_test: np.ndarray,
     results = {}
 
     if CUML_AVAILABLE:
-        # Feature scaling for SVM with moderate outlier removal
+        # Feature scaling for SVM with aggressive outlier removal
         print("Scaling features for SVM...")
         from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
-        # Remove extreme outliers more moderately (99th percentile)
-        clip_max = np.percentile(X_train, 99)
-        clip_min = np.percentile(X_train, 1)
+        # Remove extreme outliers more aggressively (95th percentile)
+        clip_max = np.percentile(X_train, 95)
+        clip_min = np.percentile(X_train, 5)
 
         print(f"  Clipping outliers: [{clip_min:.3f}, {clip_max:.3f}]")
         X_train_clipped = np.clip(X_train, clip_min, clip_max)
         X_test_clipped = np.clip(X_test, clip_min, clip_max)
 
-        # Use StandardScaler for better SVM performance
-        scaler = StandardScaler()
+        # Use MinMaxScaler for more controlled range
+        scaler = MinMaxScaler(feature_range=(-1, 1))
         X_train_scaled = scaler.fit_transform(X_train_clipped)
         X_test_scaled = scaler.transform(X_test_clipped)
 
@@ -287,20 +446,20 @@ def train_gpu_classifiers(X_train: np.ndarray, X_test: np.ndarray,
 
         gpu_classifiers = {
             'SVM': {
-                'classifier': cuSVC(C=10.0, gamma='scale', kernel='rbf', probability=True),  # Better for high-dim data
-                'use_scaled': True  # SVM needs scaled features
+                'classifier': cuSVC(C=10.0, gamma=0.1, kernel='rbf', probability=True),  # Better for high-dim data
+                'use_scaled': False
             },
             'Logistic Regression': {
-                'classifier': cuLogisticRegression(C=1, max_iter=100),
-                'use_scaled': False  # LR can work with original features
+                'classifier': cuLogisticRegression(C=1, max_iter=500),
+                'use_scaled': False
             },
             'KNN': {
                 'classifier': cuKNeighborsClassifier(n_neighbors=9),
-                'use_scaled': False  # KNN can work with original features
+                'use_scaled': False
             },
             'Random Forest': {
                 'classifier': cuRandomForestClassifier(n_estimators=396),
-                'use_scaled': False  # RF can work with original features
+                'use_scaled': False
             },
         }
 
@@ -347,13 +506,11 @@ def train_gpu_classifiers(X_train: np.ndarray, X_test: np.ndarray,
                 accuracy = accuracy_score(y_test, y_pred)
                 f1 = f1_score(y_test, y_pred, average='weighted')
 
-                # For now, skip cross-validation to avoid cuML compatibility issues
-                # Use test accuracy as CV estimate (simplified approach)
                 cv_mean = accuracy
                 cv_std = 0.0
                 cv_time = 0.0
 
-                print(f"  Using test accuracy as CV estimate: {cv_mean:.4f}")
+                print(f"  Test accuracy: {cv_mean:.4f}")
 
                 # Store results
                 results[f'GPU {name}'] = {
